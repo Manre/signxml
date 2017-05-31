@@ -15,8 +15,8 @@ from cryptography.hazmat.backends import default_backend
 
 from asn1crypto.algos import DSASignature
 
-from .exceptions import InvalidSignature, InvalidDigest, InvalidInput, InvalidCertificate  # noqa
-from .util import (bytes_to_long, long_to_bytes, strip_pem_header, add_pem_header, ensure_bytes, ensure_str, Namespace,
+from signxml.exceptions import InvalidSignature, InvalidDigest, InvalidInput, InvalidCertificate  # noqa
+from signxml.util import (bytes_to_long, long_to_bytes, strip_pem_header, add_pem_header, ensure_bytes, ensure_str, Namespace,
                    XMLProcessor, iterate_pem, verify_x509_cert_chain)
 from collections import namedtuple
 
@@ -34,6 +34,9 @@ namespaces = Namespace(
 
 def ds_tag(tag):
     return "{" + namespaces.ds + "}" + tag
+
+def ec_tag(tag):
+    return "{" + namespaces.ec + "}" + tag
 
 def dsig11_tag(tag):
     return "{" + namespaces.dsig11 + "}" + tag
@@ -283,7 +286,7 @@ class XMLSigner(XMLSignatureProcessor):
         self._parser = None
 
     def sign(self, data, key=None, passphrase=None, cert=None, reference_uri=None, key_name=None, key_info=None,
-             id_attribute=None):
+             id_attribute=None, inclusive_ns_prefixes=None, transform_inclusive_ns_prefixes=None, custom_namespaces=None):
         """
         Sign the data and return the root element of the resulting XML tree.
 
@@ -344,12 +347,12 @@ class XMLSigner(XMLSignatureProcessor):
             reference_uris = reference_uri
 
         sig_root, doc_root, c14n_inputs, reference_uris = self._unpack(data, reference_uris)
-        signed_info_element, signature_value_element = self._build_sig(sig_root, reference_uris, c14n_inputs)
+        signed_info_element, signature_value_element = self._build_sig(sig_root, reference_uris, c14n_inputs, inclusive_ns_prefixes, transform_inclusive_ns_prefixes, custom_namespaces=custom_namespaces)
 
         if key is None:
             raise InvalidInput('Parameter "key" is required')
 
-        signed_info_c14n = self._c14n(signed_info_element, algorithm=self.c14n_alg)
+        signed_info_c14n = self._c14n(signed_info_element, algorithm=self.c14n_alg, inclusive_ns_prefixes=inclusive_ns_prefixes)
         if self.sign_alg.startswith("hmac-"):
             from cryptography.hazmat.primitives.hmac import HMAC
             signer = HMAC(key=key,
@@ -469,9 +472,10 @@ class XMLSigner(XMLSignatureProcessor):
             reference_uris = ["#object"]
         return sig_root, doc_root, c14n_inputs, reference_uris
 
-    def _build_sig(self, sig_root, reference_uris, c14n_inputs):
-        signed_info = SubElement(sig_root, ds_tag("SignedInfo"), nsmap=self.namespaces)
+    def _build_sig(self, sig_root, reference_uris, c14n_inputs, inclusive_ns_prefixes, transform_inclusive_ns_prefixes, custom_namespaces=None):
+        signed_info = SubElement(sig_root, ds_tag("SignedInfo"), nsmap=custom_namespaces)
         c14n_method = SubElement(signed_info, ds_tag("CanonicalizationMethod"), Algorithm=self.c14n_alg)
+        inclusive_ns = SubElement(c14n_method, ec_tag("InclusiveNamespaces"), PrefixList=' '.join(inclusive_ns_prefixes), nsmap=namespaces)
         if self.sign_alg.startswith("hmac-"):
             algorithm_id = self.known_hmac_digest_tags[self.sign_alg]
         else:
@@ -483,10 +487,14 @@ class XMLSigner(XMLSignatureProcessor):
                 transforms = SubElement(reference, ds_tag("Transforms"))
                 SubElement(transforms, ds_tag("Transform"), Algorithm=namespaces.ds + "enveloped-signature")
                 SubElement(transforms, ds_tag("Transform"), Algorithm=self.c14n_alg)
+            if self.method == methods.detached:
+                transforms = SubElement(reference, ds_tag("Transforms"))
+                tranform = SubElement(transforms, ds_tag("Transform"), Algorithm=self.c14n_alg)
+                inclusive_ns = SubElement(tranform, ec_tag("InclusiveNamespaces"), PrefixList=' '.join(transform_inclusive_ns_prefixes), nsmap=namespaces)
             digest_method = SubElement(reference, ds_tag("DigestMethod"),
                                        Algorithm=self.known_digest_tags[self.digest_alg])
             digest_value = SubElement(reference, ds_tag("DigestValue"))
-            payload_c14n = self._c14n(c14n_inputs[i], algorithm=self.c14n_alg)
+            payload_c14n = self._c14n(c14n_inputs[i], algorithm=self.c14n_alg, inclusive_ns_prefixes=inclusive_ns_prefixes)
             digest = self._get_digest(payload_c14n, self._get_digest_method_by_tag(self.digest_alg))
             digest_value.text = digest
         signature_value = SubElement(sig_root, ds_tag("SignatureValue"))
@@ -699,7 +707,7 @@ class XMLVerifier(XMLSignatureProcessor):
         signature_value = self._find(signature, "SignatureValue")
         signature_alg = signature_method.get("Algorithm")
         raw_signature = b64decode(signature_value.text)
-        x509_data = signature.find("ds:KeyInfo/ds:X509Data", namespaces=namespaces)
+        x509_data = signature.find('.//ds:X509Data', namespaces=namespaces)
         signed_info_c14n = self._c14n(signed_info, algorithm=c14n_algorithm)
 
         if x509_data is not None or self.require_x509:
